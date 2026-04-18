@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from app.fitting.cube_io import LUT_SIZE, identity_lut, read_cube, write_cube
-from app.fitting.idt import _idt, fit_lut_from_reference
+from app.fitting.idt import _idt, _smooth_lut, fit_lut_histmatch, fit_lut_idt, fit_lut_from_reference
 
 
 def test_identity_lut_shape_and_range() -> None:
@@ -78,3 +78,52 @@ def test_fit_lut_deterministic_with_seed() -> None:
     a = fit_lut_from_reference(ref, n_iter=5, seed=42)
     b = fit_lut_from_reference(ref, n_iter=5, seed=42)
     np.testing.assert_allclose(a, b, atol=0.0)
+
+
+def test_smoothing_reduces_local_variation() -> None:
+    """A smoothed LUT should have less cell-to-cell variation than its unsmoothed source."""
+    rng = np.random.default_rng(0)
+    noisy = rng.uniform(0, 1, size=(LUT_SIZE, LUT_SIZE, LUT_SIZE, 3)).astype(np.float32)
+    smoothed = _smooth_lut(noisy, sigma=1.0)
+
+    def total_variation(lut: np.ndarray) -> float:
+        dx = np.abs(np.diff(lut, axis=0)).sum()
+        dy = np.abs(np.diff(lut, axis=1)).sum()
+        dz = np.abs(np.diff(lut, axis=2)).sum()
+        return float(dx + dy + dz)
+
+    assert total_variation(smoothed) < 0.5 * total_variation(noisy)
+
+
+def test_histmatch_fallback_also_shifts() -> None:
+    """The L2 fallback (per-channel LAB histogram matching) should also deviate from identity."""
+    ref = _synthetic_warm_reference()
+    lut = fit_lut_histmatch(ref)
+    id_lut = identity_lut(LUT_SIZE)
+    assert lut.shape == id_lut.shape
+    diff = np.linalg.norm(lut - id_lut, axis=-1)
+    assert diff.max() > 0.02, f"histmatch LUT flat (max diff {diff.max():.4f})"
+
+
+def _correlated_reference() -> np.ndarray:
+    """A 128×128 reference with strong cross-channel correlation (R high ↔ B low, G mid-varies)."""
+    rng = np.random.default_rng(7)
+    h = w = 128
+    noise = rng.normal(0.0, 10.0, size=(h, w)).astype(np.float32)
+    r = np.clip(80 + 0.9 * np.arange(w)[None, :] + noise, 0, 255)
+    b = np.clip(220 - 0.9 * np.arange(w)[None, :] + noise, 0, 255)
+    g = np.clip(150 + 0.5 * np.arange(h)[:, None] - 0.4 * np.arange(w)[None, :], 0, 255)
+    return np.stack([r, g, b], axis=-1).astype(np.uint8)
+
+
+def test_idt_and_histmatch_differ() -> None:
+    """On a reference with cross-channel correlation IDT must capture structure the
+    per-channel fallback cannot — the LUTs should diverge."""
+    ref = _correlated_reference()
+    idt = fit_lut_idt(ref, n_iter=20, seed=0)
+    hist = fit_lut_histmatch(ref)
+    diff = np.linalg.norm(idt - hist, axis=-1)
+    assert diff.max() > 0.01, (
+        f"IDT and histmatch nearly identical (max diff {diff.max():.4f}) — "
+        "expected IDT to diverge on cross-channel-correlated reference"
+    )

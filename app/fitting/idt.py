@@ -3,6 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PIL import Image
+from skimage.filters import gaussian as skimage_gaussian
 
 from app.fitting.cube_io import LUT_SIZE, identity_lut
 
@@ -78,50 +79,38 @@ def _downsample(img: Image.Image, max_edge: int) -> Image.Image:
     return img
 
 
-def fit_lut_from_reference(
+def _smooth_lut(lut: np.ndarray, sigma: float) -> np.ndarray:
+    """Apply separable 3-D Gaussian smoothing along the grid axes only (channels untouched)."""
+    if sigma <= 0:
+        return lut
+    return skimage_gaussian(lut, sigma=sigma, channel_axis=-1).astype(np.float32)
+
+
+def _prepare_reference(
     reference_rgb_u8: np.ndarray,
-    *,
-    lut_size: int = LUT_SIZE,
-    n_iter: int = 20,
-    seed: int = 0,
-    downsample_edge: int = 256,
-    confidence_floor: float = 0.02,
-) -> np.ndarray:
-    """Fit a 3-D LUT that maps neutral sRGB cells → the reference's color distribution.
-
-    Uses Pitié–Kokaram IDT in CIELAB with a uniform identity grid as the source. The
-    fitted LUT is blended toward identity in cells where the reference's coverage
-    (measured as a coarse RGB 3-D histogram) is below `confidence_floor`. This is the
-    "confidence-weighted LUT" that keeps the live viewfinder from posterizing when
-    it ventures into colors the reference never showed.
-
-    Args:
-        reference_rgb_u8: (H, W, 3) uint8 sRGB reference image.
-        lut_size: grid resolution. Default 33 (CoreImage CIColorCube sweet spot).
-        n_iter: IDT iterations. 15–25 is typical; higher = more faithful, slower.
-        seed: RNG seed for IDT rotations (reproducible fits).
-        downsample_edge: reference is resized so the long edge is at most this many pixels.
-        confidence_floor: cells with normalized reference density below this value
-            are fully blended toward identity.
-
-    Returns:
-        (lut_size, lut_size, lut_size, 3) float32 in [0, 1], indexed as `lut[r, g, b]`.
-    """
+    downsample_edge: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate, load and downsample a reference image; return flat (rgb01, lab) pixel arrays."""
     if reference_rgb_u8.ndim != 3 or reference_rgb_u8.shape[-1] != 3:
         raise ValueError(f"Expected (H, W, 3) uint8, got {reference_rgb_u8.shape}")
-
     ref_img = Image.fromarray(reference_rgb_u8).convert("RGB")
     ref_img = _downsample(ref_img, downsample_edge)
     ref_rgb01 = np.asarray(ref_img, dtype=np.float32) / 255.0
     ref_rgb01_flat = ref_rgb01.reshape(-1, 3)
     ref_lab = _rgb01_to_lab(ref_rgb01_flat)
+    return ref_rgb01_flat, ref_lab
 
+
+def _compose_lut(
+    warped_lab_flat: np.ndarray,
+    lut_size: int,
+    ref_rgb01_flat: np.ndarray,
+    confidence_floor: float,
+    smoothing_sigma: float,
+) -> np.ndarray:
+    """Shared post-processing: LAB→sRGB → confidence-weighted blend toward identity → Gaussian smooth."""
     id_lut_rgb = identity_lut(lut_size)
-    id_flat_rgb = id_lut_rgb.reshape(-1, 3)
-    id_flat_lab = _rgb01_to_lab(id_flat_rgb)
-
-    warped_lab = _idt(id_flat_lab, ref_lab, n_iter=n_iter, seed=seed)
-    warped_rgb = _lab_to_rgb01(warped_lab).reshape(lut_size, lut_size, lut_size, 3)
+    warped_rgb = _lab_to_rgb01(warped_lab_flat).reshape(lut_size, lut_size, lut_size, 3)
 
     rgb_hist, _ = np.histogramdd(
         ref_rgb01_flat,
@@ -130,8 +119,62 @@ def fit_lut_from_reference(
     )
     peak = float(rgb_hist.max())
     density = rgb_hist / peak if peak > 0 else rgb_hist
-    confidence = np.clip((density - confidence_floor) / max(1.0 - confidence_floor, 1e-6), 0.0, 1.0)
+    confidence = np.clip(
+        (density - confidence_floor) / max(1.0 - confidence_floor, 1e-6),
+        0.0,
+        1.0,
+    )
     confidence = confidence[..., None].astype(np.float32)
 
     blended = confidence * warped_rgb + (1.0 - confidence) * id_lut_rgb
-    return np.clip(blended, 0.0, 1.0).astype(np.float32)
+    smoothed = _smooth_lut(blended, smoothing_sigma)
+    return np.clip(smoothed, 0.0, 1.0).astype(np.float32)
+
+
+def fit_lut_idt(
+    reference_rgb_u8: np.ndarray,
+    *,
+    lut_size: int = LUT_SIZE,
+    n_iter: int = 20,
+    seed: int = 0,
+    downsample_edge: int = 256,
+    confidence_floor: float = 0.02,
+    smoothing_sigma: float = 0.5,
+) -> np.ndarray:
+    """L0 — Pitié–Kokaram IDT in CIELAB, confidence-weighted, Gaussian-smoothed.
+
+    This is the plan's target algorithm. See the plan file for the framing:
+    the confidence weighting is a low-rank-style extension of LoR-LUT.
+    """
+    ref_rgb01_flat, ref_lab = _prepare_reference(reference_rgb_u8, downsample_edge)
+    id_flat_lab = _rgb01_to_lab(identity_lut(lut_size).reshape(-1, 3))
+    warped_lab = _idt(id_flat_lab, ref_lab, n_iter=n_iter, seed=seed)
+    return _compose_lut(warped_lab, lut_size, ref_rgb01_flat, confidence_floor, smoothing_sigma)
+
+
+def fit_lut_histmatch(
+    reference_rgb_u8: np.ndarray,
+    *,
+    lut_size: int = LUT_SIZE,
+    seed: int = 0,  # accepted for API parity; histogram matching is deterministic
+    downsample_edge: int = 256,
+    confidence_floor: float = 0.02,
+    smoothing_sigma: float = 0.5,
+) -> np.ndarray:
+    """L2 fallback — per-channel histogram matching in CIELAB.
+
+    The algorithm Yable flagged as "很生硬" (harsh). Kept as a safety net: if IDT
+    is misbehaving, this still produces a recognizable style transfer, even if
+    cross-channel correlations are lost.
+    """
+    del seed  # deterministic given the reference
+    ref_rgb01_flat, ref_lab = _prepare_reference(reference_rgb_u8, downsample_edge)
+    id_flat_lab = _rgb01_to_lab(identity_lut(lut_size).reshape(-1, 3))
+    warped_lab = np.empty_like(id_flat_lab)
+    for d in range(3):
+        warped_lab[:, d] = _match_hist_1d(id_flat_lab[:, d], ref_lab[:, d])
+    return _compose_lut(warped_lab, lut_size, ref_rgb01_flat, confidence_floor, smoothing_sigma)
+
+
+# Backward-compatible alias — callers using the pre-fallback-ladder name still work.
+fit_lut_from_reference = fit_lut_idt
