@@ -11,6 +11,7 @@ import numpy as np
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from PIL import Image
 
+from app.curation.claude_curator import curate_references
 from app.fitting.cube_io import write_cube
 from app.fitting.idt import fit_lut_histmatch, fit_lut_idt
 
@@ -75,8 +76,33 @@ async def fit_lut(
 
 
 @router.post("/curate")
-async def curate() -> None:
-    raise HTTPException(status_code=501, detail="curate not yet implemented")
+async def curate(references: list[UploadFile] = File(...)) -> dict:
+    """Given a bag of reference JPEGs, ask Claude vision to pick the 3-5 most
+    stylistically representative ones and name the look. Falls back to a
+    deterministic selection when `ANTHROPIC_API_KEY` is unset.
+    """
+    if not references:
+        raise HTTPException(status_code=400, detail="at least one reference image required")
+
+    jpegs: list[bytes] = []
+    for up in references:
+        raw = await up.read()
+        try:
+            Image.open(io.BytesIO(raw)).verify()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"could not decode {up.filename}: {exc}")
+        jpegs.append(raw)
+
+    t0 = time.perf_counter()
+    result = curate_references(jpegs)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    return {
+        "selected_indices": result.selected_indices,
+        "style_name": result.style_name,
+        "style_description": result.style_description,
+        "timing_ms": elapsed_ms,
+    }
 
 
 @router.get("/luts/curated/{lut_id}.cube")
