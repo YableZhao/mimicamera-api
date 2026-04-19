@@ -4,7 +4,15 @@ import numpy as np
 import pytest
 
 from app.fitting.cube_io import LUT_SIZE, identity_lut, read_cube, write_cube
-from app.fitting.idt import _idt, _smooth_lut, fit_lut_histmatch, fit_lut_idt, fit_lut_from_reference
+from app.fitting.idt import (
+    _idt,
+    _idt_2d,
+    _smooth_lut,
+    fit_lut_chroma,
+    fit_lut_from_reference,
+    fit_lut_histmatch,
+    fit_lut_idt,
+)
 
 
 def test_identity_lut_shape_and_range() -> None:
@@ -126,4 +134,26 @@ def test_idt_and_histmatch_differ() -> None:
     assert diff.max() > 0.01, (
         f"IDT and histmatch nearly identical (max diff {diff.max():.4f}) — "
         "expected IDT to diverge on cross-channel-correlated reference"
+    )
+
+
+def test_idt_2d_transfers_distribution_mean() -> None:
+    """_idt_2d should pull a 2-D source toward the target distribution."""
+    rng = np.random.default_rng(0)
+    source = rng.normal(0.5, 0.1, size=(3000, 2)).astype(np.float32)
+    target = rng.normal(0.85, 0.05, size=(3000, 2)).astype(np.float32)
+    warped = _idt_2d(source, target, n_iter=25, seed=0)
+    src_dist = float(np.linalg.norm(source.mean(axis=0) - target.mean(axis=0)))
+    warp_dist = float(np.linalg.norm(warped.mean(axis=0) - target.mean(axis=0)))
+    assert warp_dist < src_dist * 0.3
+
+
+def test_fit_lut_chroma_differs_from_full_idt() -> None:
+    """Chroma-only fitting should produce a LUT distinct from full 3-D IDT."""
+    ref = _correlated_reference()
+    full = fit_lut_idt(ref, n_iter=15, seed=0)
+    chroma = fit_lut_chroma(ref, n_iter=15, seed=0)
+    diff = np.linalg.norm(full - chroma, axis=-1)
+    assert diff.max() > 0.01, (
+        f"chroma and full-IDT LUTs nearly identical (max diff {diff.max():.4f})"
     )

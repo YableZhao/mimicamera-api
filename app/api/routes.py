@@ -13,25 +13,27 @@ from PIL import Image
 
 from app.curation.claude_curator import curate_references
 from app.fitting.cube_io import write_cube
-from app.fitting.idt import fit_lut_histmatch, fit_lut_idt
+from app.fitting.idt import fit_lut_chroma, fit_lut_histmatch, fit_lut_idt
 
 router = APIRouter()
 
 MODES: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "idt": fit_lut_idt,
     "hist": fit_lut_histmatch,
+    "chroma": fit_lut_chroma,
 }
 
 
 @router.post("/fit_lut")
 async def fit_lut(
     references: list[UploadFile] = File(...),
-    mode: str = Query("idt", pattern="^(idt|hist)$"),
+    mode: str = Query("idt", pattern="^(idt|hist|chroma)$"),
 ) -> dict:
     """Fit a 33³ LUT from one or more reference JPEGs.
 
-    `mode=idt`  — Pitié–Kokaram IDT in CIELAB (default, target quality).
-    `mode=hist` — Per-channel histogram matching in CIELAB (L2 fallback).
+    `mode=idt`    — Pitié–Kokaram IDT in CIELAB (default, target quality).
+    `mode=hist`   — Per-channel histogram matching in CIELAB (L2 fallback).
+    `mode=chroma` — IDT on (a*, b*) only with 1-D L* CDF (light-touch chromaticity).
     """
     if not references:
         raise HTTPException(status_code=400, detail="at least one reference image required")

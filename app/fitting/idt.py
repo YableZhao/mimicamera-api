@@ -71,6 +71,31 @@ def _idt(
     return s
 
 
+def _idt_2d(
+    source: np.ndarray,
+    target: np.ndarray,
+    n_iter: int,
+    seed: int,
+) -> np.ndarray:
+    """2-D variant of IDT for when we want to operate on a subset of channels
+    (e.g., `a*` and `b*` only). Each iteration draws a random 2-D rotation,
+    matches 1-D marginals along each rotated axis, rotates back.
+    """
+    rng = np.random.default_rng(seed)
+    s = source.astype(np.float32, copy=True)
+    t = target.astype(np.float32)
+    for _ in range(n_iter):
+        theta = float(rng.uniform(0.0, 2.0 * np.pi))
+        c, sn = float(np.cos(theta)), float(np.sin(theta))
+        rot = np.array([[c, -sn], [sn, c]], dtype=np.float32)
+        s_rot = s @ rot
+        t_rot = t @ rot
+        for d in range(2):
+            s_rot[:, d] = _match_hist_1d(s_rot[:, d], t_rot[:, d])
+        s = s_rot @ rot.T
+    return s
+
+
 def _downsample(img: Image.Image, max_edge: int) -> Image.Image:
     if max(img.size) <= max_edge:
         return img
@@ -184,6 +209,37 @@ def fit_lut_histmatch(
     warped_lab = np.empty_like(id_flat_lab)
     for d in range(3):
         warped_lab[:, d] = _match_hist_1d(id_flat_lab[:, d], ref_lab[:, d])
+    return _compose_lut(warped_lab, lut_size, ref_rgb01_flat, confidence_floor, smoothing_sigma)
+
+
+def fit_lut_chroma(
+    reference_rgb_u8: np.ndarray,
+    *,
+    lut_size: int = LUT_SIZE,
+    n_iter: int = 20,
+    seed: int = 0,
+    downsample_edge: int = 256,
+    confidence_floor: float = 0.02,
+    smoothing_sigma: float = 0.5,
+) -> np.ndarray:
+    """Chromaticity-only transfer: match the reference's (a*, b*) distribution
+    via 2-D IDT while matching L* through a 1-D CDF.
+
+    Produces a lighter-touch style than full 3-D IDT — scene brightness structure
+    is preserved by the 1-D L* curve rather than replaced. Useful when a
+    photographer's look is chromatic (e.g., "teal & orange") and you don't want
+    to redistribute the scene's luminances as well.
+
+    The plan calls this the "luminance pass" — in a LUT-baking context the
+    spatially-aware guided filter becomes a 1-D tone curve on L*.
+    """
+    ref_rgb01_flat, ref_lab = _prepare_reference(reference_rgb_u8, downsample_edge)
+    id_flat_lab = _rgb01_to_lab(identity_lut(lut_size).reshape(-1, 3))
+
+    warped_L = _match_hist_1d(id_flat_lab[:, 0], ref_lab[:, 0])
+    warped_ab = _idt_2d(id_flat_lab[:, 1:], ref_lab[:, 1:], n_iter=n_iter, seed=seed)
+    warped_lab = np.concatenate([warped_L[:, None], warped_ab], axis=-1).astype(np.float32)
+
     return _compose_lut(warped_lab, lut_size, ref_rgb01_flat, confidence_floor, smoothing_sigma)
 
 
