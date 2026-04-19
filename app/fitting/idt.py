@@ -107,8 +107,17 @@ def _compose_lut(
     ref_rgb01_flat: np.ndarray,
     confidence_floor: float,
     smoothing_sigma: float,
+    confidence_kde_sigma: float = 2.5,
 ) -> np.ndarray:
-    """Shared post-processing: LAB→sRGB → confidence-weighted blend toward identity → Gaussian smooth."""
+    """Shared post-processing: LAB→sRGB → confidence-weighted blend toward identity → Gaussian smooth.
+
+    `confidence_kde_sigma` smooths the reference's 3D RGB histogram before normalisation,
+    producing a kernel-density-like coverage map. Without this, a sparse synthetic reference
+    only influences the handful of cells it directly touches, leaving the rest of the LUT
+    as identity — the fitted style barely affects real scenes. A ~2–3 lattice-unit KDE
+    bandwidth lets each reference pixel contribute to its neighbourhood while still
+    falling off in genuinely unseen regions.
+    """
     id_lut_rgb = identity_lut(lut_size)
     warped_rgb = _lab_to_rgb01(warped_lab_flat).reshape(lut_size, lut_size, lut_size, 3)
 
@@ -117,6 +126,8 @@ def _compose_lut(
         bins=lut_size,
         range=((0.0, 1.0), (0.0, 1.0), (0.0, 1.0)),
     )
+    if confidence_kde_sigma > 0:
+        rgb_hist = skimage_gaussian(rgb_hist.astype(np.float32), sigma=confidence_kde_sigma)
     peak = float(rgb_hist.max())
     density = rgb_hist / peak if peak > 0 else rgb_hist
     confidence = np.clip(
