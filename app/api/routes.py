@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from PIL import Image
 from app.curation.claude_curator import curate_references
 from app.fitting.cube_io import write_cube
 from app.fitting.idt import fit_lut_chroma, fit_lut_histmatch, fit_lut_idt
+from app.integrations import unsplash
 
 _CACHE_DIR = Path(tempfile.gettempdir()) / "mimicamera-fit-cache"
 _CACHE_DIR.mkdir(exist_ok=True)
@@ -138,3 +140,17 @@ async def curate(references: list[UploadFile] = File(...)) -> dict:
 @router.get("/luts/curated/{lut_id}.cube")
 async def get_curated_lut(lut_id: str) -> None:
     raise HTTPException(status_code=501, detail="curated LUTs not yet available")
+
+
+@router.get("/unsplash/search")
+async def unsplash_search(q: str, per_page: int = 12, page: int = 1) -> dict:
+    """Proxy Unsplash Search API — keeps the access key server-side and
+    normalises the response so the iOS client sees a stable shape."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="query 'q' is required")
+    photos = await unsplash.search(q, per_page=min(per_page, 30), page=max(page, 1))
+    return {
+        "query": q,
+        "results": [photo.__dict__ for photo in photos],
+        "keyed": bool(os.environ.get("UNSPLASH_ACCESS_KEY")),
+    }
