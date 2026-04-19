@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import tempfile
 import time
@@ -14,6 +15,21 @@ from PIL import Image
 from app.curation.claude_curator import curate_references
 from app.fitting.cube_io import write_cube
 from app.fitting.idt import fit_lut_chroma, fit_lut_histmatch, fit_lut_idt
+
+_CACHE_DIR = Path(tempfile.gettempdir()) / "mimicamera-fit-cache"
+_CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _cache_key(raw_jpegs: list[bytes], mode: str) -> str:
+    """SHA-256 over mode + sorted-by-hash list of reference JPEGs. Order-invariant so
+    a photographer supplying the same bag in a different order still hits the cache.
+    """
+    digests = sorted(hashlib.sha256(j).hexdigest() for j in raw_jpegs)
+    acc = hashlib.sha256()
+    acc.update(mode.encode())
+    for d in digests:
+        acc.update(d.encode())
+    return acc.hexdigest()
 
 router = APIRouter()
 
@@ -40,6 +56,7 @@ async def fit_lut(
     if mode not in MODES:
         raise HTTPException(status_code=400, detail=f"unknown mode {mode!r}")
 
+    raw_jpegs: list[bytes] = []
     pixels: list[np.ndarray] = []
     for up in references:
         raw = await up.read()
@@ -47,7 +64,23 @@ async def fit_lut(
             img = Image.open(io.BytesIO(raw)).convert("RGB")
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"could not decode {up.filename}: {exc}")
+        raw_jpegs.append(raw)
         pixels.append(np.asarray(img, dtype=np.uint8))
+
+    cache_key = _cache_key(raw_jpegs, mode)
+    cached_path = _CACHE_DIR / f"{cache_key}.cube"
+    t0 = time.perf_counter()
+    if cached_path.exists():
+        cube_bytes = cached_path.read_bytes()
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        return {
+            "mode": mode,
+            "cube_b64": base64.b64encode(cube_bytes).decode("ascii"),
+            "style_name": "Untitled",
+            "style_description": "Cached fit — Claude curation wires style metadata separately.",
+            "timing_ms": elapsed_ms,
+            "cached": True,
+        }
 
     combined = np.concatenate([p.reshape(-1, 3) for p in pixels], axis=0)
     side = int(np.ceil(np.sqrt(combined.shape[0])))
@@ -56,17 +89,11 @@ async def fit_lut(
         combined = np.concatenate([combined, combined[:pad]], axis=0)
     reference_block = combined.reshape(side, side, 3)
 
-    t0 = time.perf_counter()
     lut = MODES[mode](reference_block)
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
-    with tempfile.NamedTemporaryFile(suffix=".cube", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        write_cube(lut, tmp_path, title=f"Mimicamera ({mode})")
-        cube_b64 = base64.b64encode(tmp_path.read_bytes()).decode("ascii")
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    write_cube(lut, cached_path, title=f"Mimicamera ({mode})")
+    cube_b64 = base64.b64encode(cached_path.read_bytes()).decode("ascii")
 
     return {
         "mode": mode,
@@ -74,6 +101,7 @@ async def fit_lut(
         "style_name": "Untitled",
         "style_description": "Style naming is wired in D10 with Claude curation.",
         "timing_ms": elapsed_ms,
+        "cached": False,
     }
 
 
